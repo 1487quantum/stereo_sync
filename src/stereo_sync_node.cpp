@@ -1,4 +1,21 @@
-//#include "masker_util/stereo_sync_node.hpp"
+/*
+ * ROS Stereo Image Synchroniser  
+ * stereo_sync_node.cpp
+ * 
+ *
+ *  __ _  _   ___ ______ ____                    _                   
+ * /_ | || | / _ \____  / __ \                  | |                  
+ *  | | || || (_) |  / / |  | |_   _  __ _ _ __ | |_ _   _ _ __ ___  
+ *  | |__   _> _ <  / /| |  | | | | |/ _` | '_ \| __| | | | '_ ` _ \ 
+ *  | |  | || (_) |/ / | |__| | |_| | (_| | | | | |_| |_| | | | | | |
+ *  |_|  |_| \___//_/   \___\_\\__,_|\__,_|_| |_|\__|\__,_|_| |_| |_|
+ *
+ * Copyright (C) 2020 1487Quantum
+ * 
+ * 
+ * Licensed under the MIT License.
+ * 
+ */
 
 #include <ros/ros.h>
 #include <geometry_msgs/Point.h>
@@ -12,6 +29,9 @@
 #include "opencv2/imgcodecs.hpp"
 #include "boost/date_time/posix_time/posix_time.hpp"
 
+#include <opencv2/ximgproc.hpp>
+#include <opencv2/features2d.hpp>
+
 class stereo_sync_node {
 public:
     stereo_sync_node(const ros::NodeHandle& nh_);
@@ -24,20 +44,23 @@ private:
     std::string topic_out; //Output topic name
     ros::NodeHandle nh; //Node handle
     // Pub/Sub
-    image_transport::Publisher imgPub;
-    ros::Publisher pub_info_camera;
+    image_transport::Publisher imgPub_L;
+    image_transport::Publisher imgPub_R;
+    ros::Publisher pub_info_camera_L;
+    ros::Publisher pub_info_camera_R;
 
     image_transport::CameraSubscriber imgSubL;
     image_transport::CameraSubscriber imgSubR;
 
-   cv::Mat leftImg;
+    cv::Mat leftImg;
     cv::Mat rightImg;
 
-    sensor_msgs::CameraInfoConstPtr leftTime;
-    sensor_msgs::CameraInfoConstPtr rightTime;
+    sensor_msgs::CameraInfo leftTime;
+    sensor_msgs::CameraInfo rightTime;
 
-    void compareTime(const sensor_msgs::CameraInfoConstPtr& left, const sensor_msgs::CameraInfoConstPtr& right);
-    int getMilli(const sensor_msgs::CameraInfoConstPtr& cam_info, const int& accuracy, bool getFull);
+    void compareTime(const sensor_msgs::CameraInfo& left, const sensor_msgs::CameraInfo& right);
+    int getMilli(const sensor_msgs::CameraInfo& cam_info, const int& accuracy, bool getFull);
+    sensor_msgs::CameraInfo extractCamInfo(const sensor_msgs::CameraInfoConstPtr& cptr);
 };
 
 stereo_sync_node::stereo_sync_node(const ros::NodeHandle& nh_)
@@ -53,39 +76,82 @@ bool stereo_sync_node::init()
     imgSubL = it_L.subscribeCamera("/left/image_raw", 1, &stereo_sync_node::imgL_callback, this);
     imgSubR = it_R.subscribeCamera("/right/image_raw", 1, &stereo_sync_node::imgR_callback, this);
 
-    // imgPub = it.advertise(this->topic_out + "/image_raw", 1);
-    // pub_info_camera = this->nh.advertise<sensor_msgs::CameraInfo>(this->topic_out + "/camera_info", 1);
+    imgPub_L = it_L.advertise("/left_sync/image_raw", 1);
+    imgPub_R = it_R.advertise("/right_sync/image_raw", 1);
+    pub_info_camera_L = this->nh.advertise<sensor_msgs::CameraInfo>("/left_sync/camera_info", 1);
+    pub_info_camera_R = this->nh.advertise<sensor_msgs::CameraInfo>("/right_sync/camera_info", 1);
 
     return true;
 }
 
 //larger accuracy int->higher framerate, default 1e4
-int stereo_sync_node::getMilli(const sensor_msgs::CameraInfoConstPtr& cam_info, const int& accuracy, bool getFull)
+int stereo_sync_node::getMilli(const sensor_msgs::CameraInfo& cam_info, const int& accuracy, bool getFull)
 {
-    boost::posix_time::ptime tmp_posix_time = cam_info->header.stamp.toBoost();
+    boost::posix_time::ptime tmp_posix_time = cam_info.header.stamp.toBoost();
     //std::string iso_time_str = boost::posix_time::to_iso_extended_string(tmp_posix_time);
     //ROS_WARN_STREAM("R: "+iso_time_str+ "\tSC: "+std::to_string(t_seconds));
     return tmp_posix_time.time_of_day().fractional_seconds() / (getFull ? 1 : accuracy); //Get full would not divide for accuracy comparision
 }
 
-void stereo_sync_node::compareTime(const sensor_msgs::CameraInfoConstPtr& left, const sensor_msgs::CameraInfoConstPtr& right)
+sensor_msgs::CameraInfo stereo_sync_node::extractCamInfo(const sensor_msgs::CameraInfoConstPtr& cptr)
+{
+    sensor_msgs::CameraInfo tmpInfo;
+    tmpInfo.header = cptr->header;
+    tmpInfo.height = cptr->height;
+    tmpInfo.width = cptr->width;
+    tmpInfo.distortion_model = cptr->distortion_model;
+    tmpInfo.D = cptr->D;
+    tmpInfo.K = cptr->K;
+    tmpInfo.R = cptr->R;
+    tmpInfo.P = cptr->P;
+    tmpInfo.binning_x = cptr->binning_x;
+    tmpInfo.binning_y = cptr->binning_y;
+    tmpInfo.roi = cptr->roi;
+    return tmpInfo;
+}
+
+void stereo_sync_node::compareTime(const sensor_msgs::CameraInfo& left, const sensor_msgs::CameraInfo& right)
 {
     int accuracy = 1e4;
-    int maxDiff{ 2500 };
+    int maxDiff{ 2000 };
     int leftSec{ getMilli(left, accuracy, 1) };
     int rightSec{ getMilli(right, accuracy, 1) };
     int offset{ leftSec - rightSec };
     if (offset < 0)
         offset *= -1;
-    if ((leftSec / accuracy == rightSec / accuracy) && offset <= maxDiff){
+    if ((leftSec / accuracy == rightSec / accuracy) && offset <= maxDiff) {
         ROS_WARN_STREAM("Time sync: " + std::to_string(leftSec / accuracy) + "\tOffset: " + std::to_string(offset));
- cv::namedWindow("Original", cv::WINDOW_NORMAL);
-cv::Mat iL = this->leftImg;
-cv::Mat iR = this->rightImg;
- //cv::hconcat(iL,iR,iL);
-        cv::imshow("Original", iL);
+
+        cv::Mat iL = this->leftImg;
+        cv::Mat iR = this->rightImg;
+
+        //Publish result
+        imgPub_L.publish(cv_bridge::CvImage(std_msgs::Header(), "bgr8", iL).toImageMsg());
+        imgPub_R.publish(cv_bridge::CvImage(std_msgs::Header(), "bgr8", iR).toImageMsg());
+
+        //Set header stamp
+        ros::Time timeNow = ros::Time::now();
+        this->leftTime.header.stamp = timeNow;
+        this->rightTime.header.stamp = timeNow;
+
+        pub_info_camera_L.publish(this->leftTime);
+        pub_info_camera_R.publish(this->rightTime);
+
+        /*
+        cv::Size sizeL(640, 480); //the dst image size,e.g.100x100
+        cv::Size sizeR(640, 480); //the dst image size,e.g.100x100
+        cv::Mat dstL; //dst image
+        cv::Mat dstR; //dst image
+        cv::Mat mf;
+        cv::resize(iL, iL, sizeL, 0, 0, cv::INTER_AREA); //resize image
+        cv::resize(iR, iR, sizeR, 0, 0, cv::INTER_AREA); //resize image
+        // cv::hconcat(dstL,dstR,mf);
+        cv::namedWindow("22", cv::WINDOW_NORMAL);
+        cv::imshow("22", iL);
+
         cv::waitKey(1);
-}
+*/
+    }
 }
 
 // === CALLBACK & PUBLISHER ===
@@ -94,8 +160,8 @@ void stereo_sync_node::imgL_callback(const sensor_msgs::ImageConstPtr& imgp, con
     try {
         cv_bridge::CvImagePtr imagePtrRaw{ cv_bridge::toCvCopy(imgp, sensor_msgs::image_encodings::BGR8) };
 
-	this->leftImg = imagePtrRaw->image;
-        this->leftTime = cam_info;
+        this->leftImg = imagePtrRaw->image;
+        this->leftTime = extractCamInfo(cam_info);
         compareTime(this->leftTime, this->rightTime);
 
         //ROS_WARN_STREAM("L: "+iso_time_str+ "\tSC: "+std::to_string(t_seconds));
@@ -123,9 +189,8 @@ void stereo_sync_node::imgR_callback(const sensor_msgs::ImageConstPtr& imgp, con
     try {
         cv_bridge::CvImagePtr imagePtrRaw{ cv_bridge::toCvCopy(imgp, sensor_msgs::image_encodings::BGR8) };
 
-	this->rightImg = imagePtrRaw->image;
-        this->rightTime = cam_info;
-
+        this->rightImg = imagePtrRaw->image;
+        this->rightTime = extractCamInfo(cam_info);
     }
     catch (cv_bridge::Exception& e) {
         ROS_ERROR("Could not convert from '%s' to 'bgr8'.", imgp->encoding.c_str());
@@ -149,4 +214,3 @@ int main(int argc, char** argv)
 
     return 0;
 }
-
